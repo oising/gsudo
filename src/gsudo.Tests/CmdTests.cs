@@ -98,9 +98,9 @@ namespace gsudo.Tests
         public void Cmd_CommandLineAppNoWaitTest()
         {
             // ping should take 20 seconds
-            var p = new TestProcess("gsudo.exe", "-n ping 127.0.0.1 -n 2");
+            var p = new TestProcess("gsudo.exe", "-n ping 127.0.0.1 -n 4");
             // but gsudo should exit immediately.
-            p.WaitForExit(1000);
+            p.WaitForExit(2000);
             p.GetStdErr().Should().BeEmpty();
             p.GetStdOut().Should().BeEmpty();
         }
@@ -114,15 +114,16 @@ namespace gsudo.Tests
             {
                 p.WaitForExit(2000);
             }
-            catch (Exception)
+            catch (AssertFailedException)
             {
                 stillWaiting = true;
             }
 
             stillWaiting.Should().BeTrue();
             Process.Start("C:\\Windows\\System32\\taskkill.exe", "/f /fi \"STATUS eq RUNNING\" /im notepad.exe").WaitForExit();
-            p.GetStdErr().Should().BeEmpty();
+            System.Threading.Thread.Sleep(300);
             p.GetStdOut().Should().BeEmpty();
+            p.GetStdErr().Should().Be("Info: Elevated process exited with code 1\r\n");
         }
 
         [TestMethod]

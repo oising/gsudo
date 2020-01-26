@@ -3,6 +3,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 
 namespace gsudo.Tests
 {
@@ -13,18 +14,21 @@ namespace gsudo.Tests
         string StdOut = null;
         string StdErr = null;
 
-        public TestProcess(string exename, string arguments)
+        string OutFile = $"out{Guid.NewGuid()}";
+        string ErrFile = $"err{Guid.NewGuid()}";
+        string InFile = $"in{Guid.NewGuid()}";
+
+        public TestProcess(string exename, string arguments, string input = "")
         {
+            File.WriteAllText(InFile, input);
+
             this.Process = new Process();
             this.Process.StartInfo = new ProcessStartInfo()
             {
-                FileName = exename,
-                Arguments = arguments,
-                RedirectStandardInput = true,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                WindowStyle = ProcessWindowStyle.Minimized,
+                FileName = "cmd",
+                Arguments = $"/c {exename} {arguments} >{OutFile} 2>{ErrFile} <{InFile}",
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Maximized,
                 CreateNoWindow = false
             };
             this.Process.Start();
@@ -37,36 +41,28 @@ namespace gsudo.Tests
             Process.StandardInput.Write(input);
         }
 
-        public string GetStdOut() => StdOut ??= ReadAll(Process.StandardOutput);
-        public string GetStdErr() => StdErr ??= Process.StandardError.ReadToEnd();
-
-        private string ReadAll(StreamReader reader)
-        {
-            var sb = new StringBuilder();
-            char[] buffer = new char[10240];
-            int cch;
-
-            while ((cch = reader.Read(buffer, 0, buffer.Length)) > 0)
-            {
-                sb.Append(new string(buffer, 0, cch));
-            }
-
-            return sb.ToString();
-        }
-
+        public string GetStdOut() => StdOut ??= File.ReadAllText(OutFile);
+        public string GetStdErr() => StdErr ??= File.ReadAllText(ErrFile);
         public void WaitForExit(int waitMilliseconds = 30000)
         {
-            if (!Process.WaitForExit(waitMilliseconds))
+            try
             {
-                Process.Kill();
-                Debug.WriteLine($"Process Std Output:\n{GetStdOut()}");
-                Debug.WriteLine($"Process Std Error:\n{GetStdErr()}");
-
-                Assert.Fail("Process still active!");
+                if (!Process.WaitForExit(waitMilliseconds))
+                {
+                    Process.Kill();
+                    Thread.Sleep(500);
+                    Assert.Fail("Process still active!");
+                }
             }
-            Debug.WriteLine($"Process Std Output:\n{GetStdOut()}");
-            Debug.WriteLine($"Process Std Error:\n{GetStdErr()}");
+            finally
+            {
+                try
+                {
+                    Debug.WriteLine($"Process Std Output:\n{GetStdOut()}");
+                    Debug.WriteLine($"Process Std Error:\n{GetStdErr()}");
+                }
+                catch { }
+            }
         }
-
     }
 }
