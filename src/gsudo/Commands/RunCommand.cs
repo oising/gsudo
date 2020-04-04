@@ -9,33 +9,38 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.Serialization.Formatters.Binary;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Threading.Tasks;
+using gsudo.Enums;
 
 namespace gsudo.Commands
 {
     public class RunCommand : ICommand
     {
         public IEnumerable<string> CommandToRun { get; set; }
-
         private string GetArguments() => GetArgumentsString(CommandToRun, 1);
 
         public async Task<int> Execute()
         {
-            //Logger.Instance.Log("Params: " + Newtonsoft.Json.JsonConvert.SerializeObject(this), LogLevel.Debug);
+            int? exitCode;
+            bool isRunningAsDesiredUser = IsRunningAsDesiredUser();
+            bool isElevationRequired = IsElevationRequired();
 
-            var currentProcess = System.Diagnostics.Process.GetCurrentProcess();
-            bool emptyArgs = string.IsNullOrEmpty(CommandToRun.FirstOrDefault());
+            bool isShellElevation = string.IsNullOrEmpty(CommandToRun.FirstOrDefault()); // are we auto elevating the current shell?
+
+            if (isElevationRequired & ProcessHelper.GetCurrentIntegrityLevel() < (int)IntegrityLevel.Medium)
+                throw new ApplicationException("Sorry, gsudo doesn't allow to elevate from low integrity level."); // This message is not a security feature, but a nicer error message. It would have failed anyway since the named pipe's ACL restricts it.
 
             CommandToRun = ArgumentsHelper.AugmentCommand(CommandToRun.ToArray());
             bool isWindowsApp = ProcessFactory.IsWindowsApp(CommandToRun.FirstOrDefault());
-            var consoleMode = GetConsoleMode(isWindowsApp);
 
-            if (!RunningAsDesiredUser())
-            {
-                CommandToRun = AddCopyEnvironment(CommandToRun);
-            }
+            var elevationMode = GetElevationMode(isWindowsApp);
+
+            if (!isRunningAsDesiredUser)
+                CommandToRun = AddCopyEnvironment(CommandToRun, elevationMode);
+
             var exeName = CommandToRun.FirstOrDefault();
 
             var elevationRequest = new ElevationRequest()
@@ -43,12 +48,17 @@ namespace gsudo.Commands
                 FileName = exeName,
                 Arguments = GetArguments(),
                 StartFolder = Environment.CurrentDirectory,
-                NewWindow = GlobalSettings.NewWindow,
-                Wait = (!isWindowsApp && !GlobalSettings.NewWindow) || GlobalSettings.Wait,
-                Mode = consoleMode,
-                ConsoleProcessId = currentProcess.Id,
-                Prompt = consoleMode != ElevationRequest.ConsoleMode.Raw || GlobalSettings.NewWindow ? GlobalSettings.Prompt : GlobalSettings.RawPrompt
+                NewWindow = InputArguments.NewWindow,
+                Wait = (!isWindowsApp && !InputArguments.NewWindow) || InputArguments.Wait,
+                Mode = elevationMode,
+                ConsoleProcessId = Process.GetCurrentProcess().Id,
+                IntegrityLevel = InputArguments.GetIntegrityLevel(),
             };
+
+            if (isElevationRequired && Settings.SecurityEnforceUacIsolation)
+                AdjustUacIsolationRequest(elevationRequest, isShellElevation);
+
+            SetRequestPrompt(elevationRequest);
 
             Logger.Instance.Log($"Command to run: {elevationRequest.FileName} {elevationRequest.Arguments}", LogLevel.Debug);
 
@@ -61,38 +71,172 @@ namespace gsudo.Commands
                     elevationRequest.ConsoleWidth--; // weird ConEmu/Cmder fix
             }
 
-            if (RunningAsDesiredUser()) // already elevated or running as correct user. No service needed.
+            if (isRunningAsDesiredUser && isShellElevation && !InputArguments.NewWindow)
             {
-                if (emptyArgs && !GlobalSettings.NewWindow)
+                Logger.Instance.Log("Already running as the specified user/permission-level (and no command specified). Exiting...", LogLevel.Error);
+                return Constants.GSUDO_ERROR_EXITCODE;
+            } 
+            
+            if (isRunningAsDesiredUser || !isElevationRequired) // already elevated or running as correct user. No service needed.
+            {
+                return RunWithoutService(exeName, GetArguments(), elevationRequest);
+            }
+
+            if (Settings.CacheMode.Value.In(CacheMode.Disabled) ||
+                Math.Abs(Settings.CacheDuration.Value.TotalSeconds) < 1 ||
+                (InputArguments.KillCache && !IsServiceAvailable()))
+            {
+                exitCode = await RunUsingSingleUseElevation(elevationRequest).ConfigureAwait(false);
+            }
+            else if (Settings.CacheMode.Value.In(CacheMode.Auto)
+                || elevationRequest.Mode != ElevationRequest.ConsoleMode.TokenSwitch)
+            {
+                exitCode = await RunUsingElevatedService(elevationRequest).ConfigureAwait(false);
+            }
+            else if (Settings.CacheMode.Value == CacheMode.Explicit && IsServiceAvailable())
+            {
+                exitCode = await RunUsingElevatedService(elevationRequest).ConfigureAwait(false);
+            }
+            else
+            {
+                exitCode = await RunUsingSingleUseElevation(elevationRequest).ConfigureAwait(false);
+            }
+
+            if (exitCode.HasValue && exitCode.Value != Constants.GSUDO_ERROR_EXITCODE)
+            {
+                Logger.Instance.Log($"Process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
+            }
+
+            return exitCode ?? 0;
+
+        }
+
+        private bool IsServiceAvailable()
+        {
+            return NamedPipeClient.IsServiceAvailable();
+        }
+
+        /// <summary>
+        /// Single elevation mode means no service is kept running. Also the command line shown in UAC is a little bit more explicit.
+        /// </summary>
+        /// <param name="elevationRequest"></param>
+        /// <returns></returns>
+        private async Task<int> RunUsingSingleUseElevation(ElevationRequest elevationRequest)
+        {
+            Logger.Instance.Log($"Using Console mode {ElevationRequest.ConsoleMode.TokenSwitch}", LogLevel.Debug);
+
+            var renderer = new TokenSwitchRenderer(null, elevationRequest);
+
+            if (StartSingleUseElevatedService(elevationRequest.TargetProcessId))
+                return await renderer.GetResult().ConfigureAwait(false);
+            else
+            {
+                renderer.TerminateProcess();
+                return Constants.GSUDO_ERROR_EXITCODE;
+            }
+        }
+
+        private static void SetRequestPrompt(ElevationRequest elevationRequest)
+        {
+            if ((int)InputArguments.GetIntegrityLevel() < (int)IntegrityLevel.High)
+                elevationRequest.Prompt = Environment.GetEnvironmentVariable("PROMPT", EnvironmentVariableTarget.User) ?? Environment.GetEnvironmentVariable("PROMPT", EnvironmentVariableTarget.Machine) ?? "$P$G";
+            else if (elevationRequest.Mode != ElevationRequest.ConsoleMode.Piped || InputArguments.NewWindow)
+                elevationRequest.Prompt = Settings.Prompt;
+            else
+                elevationRequest.Prompt = Settings.PipedPrompt;
+        }
+
+        /// Starts a cache session
+        private async Task<int> RunUsingElevatedService(ElevationRequest elevationRequest)
+        {
+            Logger.Instance.Log($"Using Console mode {elevationRequest.Mode}", LogLevel.Debug);
+
+            var cmd = CommandToRun.FirstOrDefault();
+
+            Rpc.Connection connection = null;
+            try
+            {
+                connection = await ConnectStartElevatedService().ConfigureAwait(false);
+
+                if (connection == null) // service is not running or listening.
                 {
-                    Logger.Instance.Log("Already elevated (and no parameters specified). Exiting...", LogLevel.Error);
+                    Logger.Instance.Log("Unable to connect to the elevated service.", LogLevel.Error);
                     return Constants.GSUDO_ERROR_EXITCODE;
                 }
 
-                Logger.Instance.Log("Already elevated. Running in-process", LogLevel.Debug);
+                var renderer = GetRenderer(connection, elevationRequest);
+                await WriteElevationRequest(elevationRequest, connection).ConfigureAwait(false);
+                ConnectionKeepAliveThread.Start(connection);
 
-                // No need to escalate. Run in-process
+                var exitCode = await renderer.Start().ConfigureAwait(false);
 
-                if (elevationRequest.Mode == ElevationRequest.ConsoleMode.Raw && !elevationRequest.NewWindow)
-                {
-                    if (!string.IsNullOrEmpty(GlobalSettings.RawPrompt.Value))
-                        Environment.SetEnvironmentVariable("PROMPT", Environment.ExpandEnvironmentVariables(GlobalSettings.RawPrompt.Value));
-                }
-                else
-                {
-                    if (!string.IsNullOrEmpty(GlobalSettings.Prompt.Value))
-                        Environment.SetEnvironmentVariable("PROMPT", Environment.ExpandEnvironmentVariables(GlobalSettings.Prompt.Value));
-                }
+                return exitCode;
+            }
+            finally
+            {
+                connection?.Dispose();
+            }
+        }
 
-                if (GlobalSettings.NewWindow)
+        private async Task<Connection> ConnectStartElevatedService()
+        {
+            var callingPid = ProcessHelper.GetCallerPid();
+
+            Logger.Instance.Log($"Caller PID: {callingPid}", LogLevel.Debug);
+
+            if (InputArguments.IntegrityLevel.HasValue && InputArguments.IntegrityLevel.Value == IntegrityLevel.System && !InputArguments.RunAsSystem)
+            {
+                Logger.Instance.Log($"Elevating as System because of IntegrityLevel=System parameter.", LogLevel.Warning);
+                InputArguments.RunAsSystem = true;
+            }
+
+            IRpcClient rpcClient = new NamedPipeClient();
+
+            Connection connection = null;
+            try
+            {
+                connection = await rpcClient.Connect(null, true).ConfigureAwait(false);
+            }
+            catch (System.IO.IOException) { }
+            catch (TimeoutException) { }
+            catch (Exception ex)
+            {
+                Logger.Instance.Log(ex.ToString(), LogLevel.Warning);
+            }
+
+            if (connection == null) // service is not running or listening.
+            {
+                // Start elevated service instance
+                if (!StartElevatedService(callingPid, cacheDuration: null))
+                    return null;
+
+                connection = await rpcClient.Connect(callingPid, false).ConfigureAwait(false);
+            }
+            return connection;
+        }
+
+        private static int RunWithoutService(string exeName, string args, ElevationRequest elevationRequest)
+        {
+            Logger.Instance.Log("Already running as the specified user/permission-level. Running in-process...", LogLevel.Debug);
+            var sameIntegrity = (int)InputArguments.GetIntegrityLevel() == ProcessHelper.GetCurrentIntegrityLevel();
+            // No need to escalate. Run in-process
+
+            if (!string.IsNullOrEmpty(elevationRequest.Prompt))
+            {
+                Environment.SetEnvironmentVariable("PROMPT", Environment.ExpandEnvironmentVariables(elevationRequest.Prompt));
+            }
+
+            if (sameIntegrity)
+            {
+                if (elevationRequest.NewWindow)
                 {
-                    using (Process process = ProcessFactory.StartDetached(exeName, GetArguments(), Environment.CurrentDirectory, false))
+                    using (var process = ProcessFactory.StartDetached(exeName, args, Environment.CurrentDirectory, false))
                     {
                         if (elevationRequest.Wait)
                         {
                             process.WaitForExit();
                             var exitCode = process.ExitCode;
-                            Logger.Instance.Log($"Elevated process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
+                            Logger.Instance.Log($"Process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
                             return exitCode;
                         }
                         return 0;
@@ -100,90 +244,106 @@ namespace gsudo.Commands
                 }
                 else
                 {
-                    using (Process process = ProcessFactory.StartInProcessAtached(exeName, GetArguments()))
+                    using (Process process = ProcessFactory.StartAttached(exeName, args))
                     {
                         process.WaitForExit();
                         var exitCode = process.ExitCode;
-                        Logger.Instance.Log($"Elevated process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
+                        Logger.Instance.Log($"Process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
                         return exitCode;
                     }
                 }
             }
-            else
+            else // lower integrity
             {
-                Logger.Instance.Log($"Using Console mode {elevationRequest.Mode}", LogLevel.Debug);
-                var callingPid = GetCallingPid(currentProcess);
-                var callingSid = WindowsIdentity.GetCurrent().User.Value;
-                Logger.Instance.Log($"Caller PID: {callingPid}", LogLevel.Debug);
-                Logger.Instance.Log($"Caller SID: {callingSid}", LogLevel.Debug);
+                var p = ProcessFactory.StartAttachedWithIntegrity(InputArguments.GetIntegrityLevel(), exeName, args, elevationRequest.StartFolder, InputArguments.NewWindow, !InputArguments.NewWindow);
+                if (p == null || p.IsInvalid)
+                    return Constants.GSUDO_ERROR_EXITCODE;
 
-                var cmd = CommandToRun.FirstOrDefault();
-
-                var rpcClient = GetClient(elevationRequest);
-                Rpc.Connection connection = null;
-
-                try
+                if (elevationRequest.Wait)
                 {
-                    try
-                    {
-                        connection = await rpcClient.Connect(elevationRequest, null, 300).ConfigureAwait(false);
-                    }
-                    catch (System.IO.IOException) { }
-                    catch (TimeoutException) { }
-                    catch (Exception ex)
-                    {
-                        Logger.Instance.Log(ex.ToString(), LogLevel.Warning);
-                    }
-
-                    if (connection == null) // service is not running or listening.
-                    {
-                        // Start elevated service instance
-                        if (!StartElevatedService(currentProcess, callingPid, callingSid))
-                            return Constants.GSUDO_ERROR_EXITCODE;
-
-                        connection = await rpcClient.Connect(elevationRequest, callingPid, 5000).ConfigureAwait(false);
-                    }
-
-                    if (connection == null) // service is not running or listening.
-                    {
-                        Logger.Instance.Log("Unable to connect to the elevated service.", LogLevel.Error);
-                        return Constants.GSUDO_ERROR_EXITCODE;
-                    }
-
-                    await WriteElevationRequest(elevationRequest, connection).ConfigureAwait(false);
-
-                    ConnectionKeepAliveThread.Start(connection);
-
-                    var renderer = GetRenderer(connection, elevationRequest);
-                    var exitCode = await renderer.Start().ConfigureAwait(false);
-
-                    if (!(elevationRequest.NewWindow && !elevationRequest.Wait))
-                        Logger.Instance.Log($"Elevated process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
-
+                    ProcessHelper.GetProcessWaitHandle(p.DangerousGetHandle()).WaitOne();
+                    ProcessApi.GetExitCodeProcess(p, out var exitCode);
+                    Logger.Instance.Log($"Process exited with code {exitCode}", exitCode == 0 ? LogLevel.Debug : LogLevel.Info);
                     return exitCode;
                 }
-                finally
+
+                return 0;
+            }
+        }
+
+        // Enforce SecurityEnforceUacIsolation
+        private void AdjustUacIsolationRequest(ElevationRequest elevationRequest, bool isShellElevation)
+        {
+            if ((int)(InputArguments.GetIntegrityLevel()) >= ProcessHelper.GetCurrentIntegrityLevel())
+            {
+                if (!elevationRequest.NewWindow)
                 {
-                    connection?.Dispose();
+                    if (isShellElevation)
+                    {
+                        // force auto shell elevation in new window
+                        elevationRequest.NewWindow = true;
+                        // do not wait by default on this scenario, only if user has requested it.
+                        elevationRequest.Wait = InputArguments.Wait;
+                        Logger.Instance.Log("Elevating shell in a new console window because of SecurityEnforceUacIsolation", LogLevel.Info);
+                    }
+                    else
+                    {
+                        // force raw mode (that disables user input with SecurityEnforceUacIsolation)
+                        elevationRequest.Mode = ElevationRequest.ConsoleMode.Piped;
+                        Logger.Instance.Log("User Input disabled because of SecurityEnforceUacIsolation. Press Ctrl-C three times to abort. Or use -n argument to elevate in new window.", LogLevel.Warning);
+                    }
                 }
             }
         }
 
-        private static bool StartElevatedService(Process currentProcess, int callingPid, string callingSid)
+        internal static bool StartElevatedService(int? allowedPid, TimeSpan? cacheDuration)
         {
-            var dbg = GlobalSettings.Debug ? "--debug " : string.Empty;
-            Process process;
-            if (GlobalSettings.RunAsSystem && ProcessExtensions.IsAdministrator())
+            var callingSid = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
+            var callingPid = allowedPid ?? ProcessHelper.GetCallerPid();
+
+            Logger.Instance.Log($"Caller SID: {callingSid}", LogLevel.Debug);
+
+            var @params = InputArguments.Debug ? "--debug " : string.Empty;
+//            if (InputArguments.IntegrityLevel.HasValue) @params += $"-i {InputArguments.IntegrityLevel.Value} ";
+//            if (InputArguments.RunAsSystem) @params += "-s ";
+            if (!cacheDuration.HasValue) cacheDuration = Settings.CacheDuration;
+
+            bool isAdmin = ProcessHelper.IsHighIntegrity();
+            string proxy = string.Empty;
+            string ownExe = ProcessHelper.GetOwnExeName();
+
+            string commandLine = $"{@params}{proxy}gsudoservice {callingPid} {callingSid} {Settings.LogLevel} {Settings.TimeSpanWithInfiniteToString(cacheDuration.Value)}";
+
+#if TO_BE_REMOVED_10
+            if ( // unfortunate combinations that requires two jumps
+                (!isAdmin && InputArguments.RunAsSystem) // First Admin, then System.
+                // || (!isAdmin && InputArguments.GetIntegrityLevel() < IntegrityLevel.High)  // First admin, then MediumPlus
+            )
             {
-                process = ProcessFactory.StartAsSystem(currentProcess.MainModule.FileName, $"{dbg}-s gsudoservice {callingPid} {callingSid} {GlobalSettings.LogLevel}", Environment.CurrentDirectory, !GlobalSettings.Debug);
+                commandLine = $"{@params}{proxy}gsudoservicehop {allowedPid} {callingSid} {Settings.LogLevel} {cacheDuration}";
             }
-            else
+#endif
+
+            bool success = false;
+
+            try
             {
-                var verb = GlobalSettings.RunAsSystem ? "gsudosystemservice" : "gsudoservice";
-                process = ProcessFactory.StartElevatedDetached(currentProcess.MainModule.FileName, $"{dbg}{verb} {callingPid} {callingSid} {GlobalSettings.LogLevel}", !GlobalSettings.Debug);
+                if (InputArguments.RunAsSystem && isAdmin)
+                {
+                    success = null != ProcessFactory.StartAsSystem(ownExe, commandLine, Environment.CurrentDirectory, !InputArguments.Debug);
+                }
+                else
+                {
+                    success = null != ProcessFactory.StartElevatedDetached(ownExe, commandLine, !InputArguments.Debug);
+                }
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                Logger.Instance.Log(ex.Message, LogLevel.Error);
+                return false;
             }
 
-            if (process == null)
+            if (!success)
             {
                 Logger.Instance.Log("Failed to start elevated instance.", LogLevel.Error);
                 return false;
@@ -193,29 +353,81 @@ namespace gsudo.Commands
             return true;
         }
 
-        private static bool RunningAsDesiredUser()
+        internal static bool StartSingleUseElevatedService(int callingPid)
         {
-            if (GlobalSettings.RunAsSystem)
-            {
-                return WindowsIdentity.GetCurrent().IsSystem;
-            }
-            return ProcessExtensions.IsAdministrator();
-        }
+            var @params = string.Empty;
 
-        private static int GetCallingPid(Process currentProcess)
-        {
-            var parent = currentProcess.ParentProcess();
-            if (parent == null) return currentProcess.ParentProcessId();
-            while (parent.MainModule.FileName.In("sudo.exe", "gsudo.exe")) // naive shim detection
+            if (InputArguments.Debug)
             {
-                parent = parent.ParentProcess();
+                @params = "--debug ";
+                @params += "--loglevel {Settings.LogLevel} ";
+                if (InputArguments.IntegrityLevel.HasValue) @params += $"-i {InputArguments.IntegrityLevel.Value} ";
             }
 
-            return parent.Id;
+            if (InputArguments.RunAsSystem) @params += "-s ";
+            bool isAdmin = ProcessHelper.IsHighIntegrity();
+            string ownExe = ProcessHelper.GetOwnExeName();
+
+            string commandLine;
+            commandLine = $"{@params}gsudoelevate --pid {callingPid}";
+
+            Process p;
+
+            try
+            {
+                p = ProcessFactory.StartElevatedDetached(ownExe, commandLine, !InputArguments.Debug);
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                Logger.Instance.Log(ex.Message, LogLevel.Error);
+                return false;
+            }
+
+            if (p == null)
+            {
+                Logger.Instance.Log("Failed to start elevated instance.", LogLevel.Error);
+                return false;
+            }
+
+            Logger.Instance.Log("Elevated instance started.", LogLevel.Debug);
+
+            p.WaitForExit();
+
+            if (p.ExitCode == 0)
+            {
+                return true;
+            }
+
+            return false;
         }
 
-        private async Task WriteElevationRequest(ElevationRequest elevationRequest, Connection connection)
+        private static bool IsRunningAsDesiredUser()
         {
+            if (InputArguments.RunAsSystem && !WindowsIdentity.GetCurrent().IsSystem)
+                return false;
+
+            if ((int)InputArguments.GetIntegrityLevel() != ProcessHelper.GetCurrentIntegrityLevel())
+                return false;
+
+            return true;
+        }
+
+        private static bool IsElevationRequired()
+        {
+            if (InputArguments.RunAsSystem && !WindowsIdentity.GetCurrent().IsSystem)
+                return true;
+
+            var integrityLevel = InputArguments.GetIntegrityLevel();
+
+            if (integrityLevel == IntegrityLevel.MediumRestricted)
+                return true;
+
+            return (int)integrityLevel > ProcessHelper.GetCurrentIntegrityLevel();
+        }
+
+        private async static Task WriteElevationRequest(ElevationRequest elevationRequest, Connection connection)
+        {
+            // Using Binary instead of Newtonsoft.JSON to reduce load times.
             var ms = new System.IO.MemoryStream();
             new BinaryFormatter()
             { TypeFormat = System.Runtime.Serialization.Formatters.FormatterTypeStyle.TypesAlways, Binder = new MySerializationBinder() }
@@ -235,29 +447,21 @@ namespace gsudo.Commands
         /// or enhanced, colorfull VT mode with nice TAB auto-complete.
         /// </summary>
         /// <returns></returns>
-        private static ElevationRequest.ConsoleMode GetConsoleMode(bool isWindowsApp)
+        private static ElevationRequest.ConsoleMode GetElevationMode(bool isWindowsApp)
         {
-            if (isWindowsApp)
+            if (Settings.ForceAttachedConsole)
                 return ElevationRequest.ConsoleMode.Attached;
 
-            if (GlobalSettings.NewWindow || Console.IsOutputRedirected)
-                return ElevationRequest.ConsoleMode.Raw;
+            if (Settings.ForcePipedConsole)
+                return ElevationRequest.ConsoleMode.Piped;
 
-            if (GlobalSettings.ForceRawConsole)
-                return ElevationRequest.ConsoleMode.Raw;
-
-            if (GlobalSettings.ForceVTConsole)
+            if (Settings.ForceVTConsole)
                 return ElevationRequest.ConsoleMode.VT;
 
-            return ElevationRequest.ConsoleMode.Attached;
-
-            // if (TerminalHelper.TerminalHasBuiltInVTSupport()) return ElevationRequest.ConsoleMode.VT;
-            // else return ElevationRequest.ConsoleMode.Raw;
+            return ElevationRequest.ConsoleMode.TokenSwitch;
         }
 
-#pragma warning disable IDE0060,CA1801 // Remove unused parameter (reserved for future use)
-        private IRpcClient GetClient(ElevationRequest elevationRequest)
-#pragma warning restore IDE0060,CA1801 // Remove unused parameter
+        private IRpcClient GetClient()
         {
             // future Tcp implementations should be plugged here.
             return new NamedPipeClient();
@@ -265,9 +469,11 @@ namespace gsudo.Commands
 
         private static IProcessRenderer GetRenderer(Connection connection, ElevationRequest elevationRequest)
         {
+            if (elevationRequest.Mode == ElevationRequest.ConsoleMode.TokenSwitch)
+                return new TokenSwitchRenderer(connection, elevationRequest);
             if (elevationRequest.Mode == ElevationRequest.ConsoleMode.Attached)
                 return new AttachedConsoleRenderer(connection);
-            if (elevationRequest.Mode == ElevationRequest.ConsoleMode.Raw)
+            if (elevationRequest.Mode == ElevationRequest.ConsoleMode.Piped)
                 return new PipedClientRenderer(connection);
             else
                 return new VTClientRenderer(connection, elevationRequest);
@@ -280,13 +486,18 @@ namespace gsudo.Commands
             return string.Join(" ", args.Skip(v).ToArray());
         }
 
-        internal IEnumerable<string> AddCopyEnvironment(IEnumerable<string> args)
+        /// <summary>
+        /// Copy environment variables and network shares to the destination user context
+        /// </summary>
+        /// <remarks>CopyNetworkShares is *the best I could do*. Too much verbose, asks for passwords, etc. Far from ideal.</remarks>
+        /// <returns>a modified args list</returns>
+        internal IEnumerable<string> AddCopyEnvironment(IEnumerable<string> args, ElevationRequest.ConsoleMode mode)
         {
-            if (GlobalSettings.CopyEnvironmentVariables || GlobalSettings.CopyNetworkShares)
+            if (Settings.CopyEnvironmentVariables || Settings.CopyNetworkShares)
             {
-                var silent = GlobalSettings.Debug ? string.Empty : "@"; 
+                var silent = InputArguments.Debug ? string.Empty : "@";
                 var sb = new StringBuilder();
-                if (GlobalSettings.CopyEnvironmentVariables)
+                if (Settings.CopyEnvironmentVariables && mode != ElevationRequest.ConsoleMode.TokenSwitch) // TokenSwitch already uses the current env block.
                 {
                     foreach (DictionaryEntry envVar in Environment.GetEnvironmentVariables())
                     {
@@ -296,14 +507,14 @@ namespace gsudo.Commands
                         sb.AppendLine($"{silent}SET {envVar.Key}={envVar.Value}");
                     }
                 }
-                if (GlobalSettings.CopyNetworkShares)
+                if (Settings.CopyNetworkShares)
                 {
-                    foreach (DriveInfo drive in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Network && d.Name.Length==3))
+                    foreach (DriveInfo drive in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Network && d.Name.Length == 3))
                     {
                         var tmpSb = new StringBuilder(2048);
                         var size = tmpSb.Capacity;
 
-                        var error = FileApi.WNetGetConnection(drive.Name.Substring(0,2), tmpSb, ref size);
+                        var error = FileApi.WNetGetConnection(drive.Name.Substring(0, 2), tmpSb, ref size);
                         if (error == 0)
                         {
                             sb.AppendLine($"{silent}ECHO Connecting {drive.Name.Substring(0, 2)} to {tmpSb.ToString()} 1>&2");
@@ -313,15 +524,27 @@ namespace gsudo.Commands
                     }
                 }
 
-                string tempBatName = Path.Combine(
+                string tempFolder = Path.Combine(
                     Environment.GetEnvironmentVariable("temp", EnvironmentVariableTarget.Machine), // use machine temp to ensure elevated user has access to temp folder
+                    nameof(gsudo));
+
+                var dirSec = new DirectorySecurity();
+                dirSec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
+                Directory.CreateDirectory(tempFolder, dirSec);
+
+                string tempBatName = Path.Combine(
+                    tempFolder,
                     $"{Guid.NewGuid()}.bat");
 
                 File.WriteAllText(tempBatName, sb.ToString());
 
+                System.Security.AccessControl.FileSecurity fSecurity = new System.Security.AccessControl.FileSecurity();
+                fSecurity.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), System.Security.AccessControl.FileSystemRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+                File.SetAccessControl(tempBatName, fSecurity);
+
                 return new string[] {
-                    Environment.GetEnvironmentVariable("COMSPEC"), 
-                    "/c" , 
+                    Environment.GetEnvironmentVariable("COMSPEC"),
+                    "/c" ,
                     $"\"{tempBatName} & del /q {tempBatName} & {string.Join(" ",args)}\""
                 };
             }

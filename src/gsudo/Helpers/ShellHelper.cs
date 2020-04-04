@@ -1,10 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace gsudo.Helpers
 {
@@ -14,41 +10,46 @@ namespace gsudo.Helpers
         PowerShellCore,
         PowerShellCore623BuggedGlobalInstall,
         Cmd,
+        Yori,
     }
 
     static class ShellHelper
     {
-        public static Shell DetectInvokingShell(out string ShellExeName)
+        public static Shell DetectInvokingShell(out string shellFullPath)
         {
-            // Is our current shell Powershell ? (Powershell.exe -calls-> gsudo)
-            var parentProcess = Process.GetCurrentProcess().ParentProcess();
+            var parentProcess = Process.GetCurrentProcess().GetParentProcessExcludingShim();
             if (parentProcess != null)
             {
-                var parentExeName = Path.GetFileName(parentProcess.MainModule.FileName).ToUpperInvariant();
+                string parentExeName = null;
+                shellFullPath = parentProcess.GetExeName();
+                parentExeName = Path.GetFileName(shellFullPath).ToUpperInvariant();
+
                 if (parentExeName == "POWERSHELL.EXE")
                 {
-                    ShellExeName = parentProcess.MainModule.FileName;
                     return Shell.PowerShell;
                 }
                 else if (parentExeName == "PWSH.EXE")
                 {
-                    ShellExeName = parentProcess.MainModule.FileName;
                     return Shell.PowerShellCore;
                 }
-                else
+                else if (parentExeName == "YORI.EXE")
+                {
+                    return Shell.Yori;
+                }
+                else if (parentExeName != "CMD.EXE")
                 {
                     // Depending on how pwsh was installed, Pwsh.exe -calls-> dotnet -calls-> gsudo.
-                    var grandParentProcess = parentProcess.ParentProcess();
+                    var grandParentProcess = parentProcess.GetParentProcessExcludingShim();
                     if (grandParentProcess != null)
                     {
-                        var grandParentExeName = Path.GetFileName(grandParentProcess.MainModule.FileName).ToUpperInvariant();
+                        var grandParentExeName = Path.GetFileName(grandParentProcess.GetExeName()).ToUpperInvariant();
                         if (grandParentExeName == "PWSH.EXE")
                         {
-                            ShellExeName = grandParentProcess.MainModule.FileName;
+                            shellFullPath = grandParentProcess.GetExeName();
 
-                            FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(ShellExeName);
+                            FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(shellFullPath);
 
-                            if (Version.Parse(versionInfo.FileVersion) <= Version.Parse("6.2.3.0") && ShellExeName.EndsWith(".dotnet\\tools\\pwsh.exe", StringComparison.OrdinalIgnoreCase))
+                            if (Version.Parse(versionInfo.FileVersion) <= Version.Parse("6.2.3.0") && shellFullPath.EndsWith(".dotnet\\tools\\pwsh.exe", StringComparison.OrdinalIgnoreCase))
                             {
                                 return Shell.PowerShellCore623BuggedGlobalInstall;
                             }
@@ -59,7 +60,7 @@ namespace gsudo.Helpers
                 }
             }
 
-            ShellExeName = Environment.GetEnvironmentVariable("COMSPEC");
+            shellFullPath = Environment.GetEnvironmentVariable("COMSPEC");
             return Shell.Cmd;
         }
     }

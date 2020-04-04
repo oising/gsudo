@@ -10,30 +10,47 @@ namespace gsudo.Commands
 {
     class ServiceCommand : ICommand, IDisposable
     {
-        public int allowedPid { get; set; }
-        public string allowedSid { get; set; }
-
+        public int AllowedPid { get; set; }
+        public string AllowedSid { get; set; }
         public LogLevel? LogLvl { get; set; }
+        public TimeSpan CacheDuration { get; set; }
 
         Timer ShutdownTimer;
-        void EnableTimer() => ShutdownTimer.Change((int)GlobalSettings.CredentialsCacheDuration.Value.TotalMilliseconds, Timeout.Infinite);
+        void EnableTimer()
+        {
+            if (CacheDuration != TimeSpan.MaxValue) 
+                ShutdownTimer.Change((int)CacheDuration.TotalMilliseconds, Timeout.Infinite);
+        }
+
         void DisableTimer() => ShutdownTimer.Change(Timeout.Infinite, Timeout.Infinite);
 
         public async Task<int> Execute()
         {
             // service mode
-            if (LogLvl.HasValue) GlobalSettings.LogLevel.Value = LogLvl.Value;
-
+            if (LogLvl.HasValue) Settings.LogLevel.Value = LogLvl.Value;
+            
             Console.Title = "gsudo Service";
+            var cacheLifetime = new CredentialsCacheLifetimeManager();
             Logger.Instance.Log("Service started", LogLevel.Info);
 
             using (IRpcServer server = CreateServer())
             {
-                ShutdownTimer = new Timer((o) => server.Close());
-                server.ConnectionAccepted += async (o, connection) => await AcceptConnection(connection).ConfigureAwait(false);
-                server.ConnectionClosed += (o, cònnection) => EnableTimer();
+                try
+                {
+                    cacheLifetime.OnCacheClear += server.Close;
+                    ShutdownTimer = new Timer((o) => server.Close(), null, Timeout.Infinite, Timeout.Infinite); // 10 seconds for initial connection or die.
+                    server.ConnectionAccepted += (o, connection) => AcceptConnection(connection).ConfigureAwait(false).GetAwaiter().GetResult();
+                    server.ConnectionClosed += (o, connection) => EnableTimer();
 
-                await server.Listen().ConfigureAwait(false);
+                    Logger.Instance.Log($"Service will shutdown if idle for {CacheDuration}", LogLevel.Debug);
+                    EnableTimer();
+                    await server.Listen().ConfigureAwait(false);
+                }
+                catch (System.OperationCanceledException) { }
+                finally
+                {
+                    cacheLifetime.OnCacheClear -= server.Close;
+                }
             }
 
             Logger.Instance.Log("Service stopped", LogLevel.Info);
@@ -62,6 +79,8 @@ namespace gsudo.Commands
 
         private static IProcessHost CreateProcessHost(ElevationRequest request)
         {
+            if (request.Mode == ElevationRequest.ConsoleMode.TokenSwitch)
+                return new TokenSwitchHost();
             if (request.NewWindow || !request.Wait)
                 return new NewWindowProcessHost();
             if (request.Mode == ElevationRequest.ConsoleMode.Attached)
@@ -74,10 +93,12 @@ namespace gsudo.Commands
 
         private IRpcServer CreateServer()
         {
-            return new NamedPipeServer(allowedPid, allowedSid);
+            // No credentials cache when CacheDuration = 0
+            bool singleUse = Settings.CacheDuration.Value.TotalSeconds < 1;
+            return new NamedPipeServer(AllowedPid, AllowedSid, singleUse);
         }
 
-        private async static Task<ElevationRequest> ReadElevationRequest(Stream dataPipe)
+        private static async Task<ElevationRequest> ReadElevationRequest(Stream dataPipe)
         {
             byte[] dataSize = new byte[sizeof(int)];
             await dataPipe.ReadAsync(dataSize, 0, sizeof(int)).ConfigureAwait(false);

@@ -1,20 +1,16 @@
 ﻿using gsudo.Helpers;
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace gsudo.Rpc
 {
     class NamedPipeClient : IRpcClient
     {
-        public async Task<Connection> Connect(ElevationRequest elevationRequest, int? clientPid, int timeoutMilliseconds)
+        public async Task<Connection> Connect(int? clientPid, bool failFast)
         {
-            var localServer = true;
+            int timeoutMilliseconds = failFast ? 300 : 5000;
             var server = ".";
 
             string pipeName = null;
@@ -26,35 +22,35 @@ namespace gsudo.Rpc
             {
                 if (clientPid.HasValue)
                 {
-                    pipeName = NamedPipeServer.GetPipeName(user, clientPid.Value);
-                    if (!ExistsNamedPipe(pipeName) && timeoutMilliseconds <= 300)
+                    pipeName = NamedPipeNameFactory.GetPipeName(user, clientPid.Value);
+                    if (!NamedPipeUtils.ExistsNamedPipe(pipeName) && failFast)
                     {
                         // fail fast without timeout.
                         return null;
                     }
                 }
-                else if (localServer)
+                else
                 {
-                    var callerProcess = Process.GetCurrentProcess().ParentProcess();
-                    while (callerProcess != null)
+                    var callerProcessId = Process.GetCurrentProcess().Id;
+                    while (callerProcessId > 0)
                     {
-                        pipeName = NamedPipeServer.GetPipeName(user, callerProcess.Id);
+                        callerProcessId = ProcessHelper.GetParentProcessId(callerProcessId);
+                        pipeName = NamedPipeNameFactory.GetPipeName(user, callerProcessId);
                         // Does the pipe exists?
-                        if (ExistsNamedPipe(pipeName) && timeoutMilliseconds <= 300)
+                        if (NamedPipeUtils.ExistsNamedPipe(pipeName))
                             break;
 
+                        pipeName = null;
                         // try grandfather.
-                        callerProcess = callerProcess.ParentProcess();
                     }
-                    if (callerProcess == null) return null;
                 }
 
                 if (pipeName == null) return null;
 
-                dataPipe = new NamedPipeClientStream(server, pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Impersonation, HandleInheritability.None);
+                dataPipe = new NamedPipeClientStream(server, pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Identification, HandleInheritability.None);
                 await dataPipe.ConnectAsync(timeoutMilliseconds).ConfigureAwait(false);
 
-                controlPipe = new NamedPipeClientStream(server, pipeName + "_control", PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Impersonation, HandleInheritability.None);
+                controlPipe = new NamedPipeClientStream(server, pipeName + "_control", PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Identification, HandleInheritability.None);
                 await controlPipe.ConnectAsync(timeoutMilliseconds).ConfigureAwait(false);
 
                 Logger.Instance.Log($"Connected via Named Pipe {pipeName}.", LogLevel.Debug);
@@ -67,6 +63,12 @@ namespace gsudo.Rpc
 
                 return conn;
             }
+            catch (System.TimeoutException)
+            {
+                dataPipe?.Dispose();
+                controlPipe?.Dispose();
+                return null;
+            }
             catch
             {
                 dataPipe?.Dispose();
@@ -75,59 +77,25 @@ namespace gsudo.Rpc
             }
         }
 
-        bool ExistsNamedPipe(string name)
+        public static bool IsServiceAvailable()
         {
-            var namedPipes = new List<string>();
-            Native.FileApi.WIN32_FIND_DATA lpFindFileData;
+            string pipeName = null;
+            var callerProcessId = Process.GetCurrentProcess().Id;
+            string user = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
 
-            var ptr = Native.FileApi.FindFirstFile($@"\\.\pipe\{GetRootFolder(name)}*", out lpFindFileData);
-            if (lpFindFileData.cFileName.EndsWith(name, StringComparison.Ordinal)) return true;
-            while (Native.FileApi.FindNextFile(ptr, out lpFindFileData))
+            while (callerProcessId > 0)
             {
-                if (lpFindFileData.cFileName.EndsWith(name, StringComparison.Ordinal))
-                {
-                    Native.FileApi.FindClose(ptr);
-                    Logger.Instance.Log($"Named Pipe \"{name}\" exists = true.", LogLevel.Debug);
-                    return true;
-                }
-            }
-            Native.FileApi.FindClose(ptr);
-            Logger.Instance.Log($"Named Pipe \"{name}\" exists = false.", LogLevel.Debug);
-            return false;
-
-        }
-
-        static string GetRootFolder(string path)
-        {
-            while (true)
-            {
-                string temp = Path.GetDirectoryName(path);
-                if (String.IsNullOrEmpty(temp))
+                callerProcessId = ProcessHelper.GetParentProcessId(callerProcessId);
+                pipeName = NamedPipeNameFactory.GetPipeName(user, callerProcessId);
+                // Does the pipe exists?
+                if (NamedPipeUtils.ExistsNamedPipe(pipeName))
                     break;
-                path = temp;
+
+                pipeName = null;
+                // try grandfather.
             }
-            return path;
-        }
 
-        public static void ListNamedPipes()
-        {
-            var namedPipes = new List<string>();
-            Native.FileApi.WIN32_FIND_DATA lpFindFileData;
-            var name = "ProtectedPrefix\\Administrators\\gsudo*";//_S-1-5-21-2190596904-3730359884-378905164-18418_36464";
-            var ptr = Native.FileApi.FindFirstFile($@"\\.\pipe\{name}", out lpFindFileData);
-            namedPipes.Add(lpFindFileData.cFileName);
-            while (Native.FileApi.FindNextFile(ptr, out lpFindFileData))
-            {
-                namedPipes.Add(lpFindFileData.cFileName);
-            }
-            Native.FileApi.FindClose(ptr);
-
-            namedPipes.Sort();
-
-            foreach (var v in namedPipes)
-                Console.WriteLine(v);
-
-            //Console.ReadLine();
+            return pipeName != null ;
         }
     }
 }

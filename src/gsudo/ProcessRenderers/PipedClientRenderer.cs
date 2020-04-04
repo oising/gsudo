@@ -12,6 +12,7 @@ namespace gsudo.ProcessRenderers
     /// <summary>
     /// Receives raw I/O from a remote process from a connection and renders on the current console.
     /// </summary>
+    [Obsolete("Experimental. Superseded by TokenSwitch mode")]
     class PipedClientRenderer : IProcessRenderer
     {
         static readonly string[] TOKENS = new string[] { "\0", "\f", Constants.TOKEN_ERROR, Constants.TOKEN_EXITCODE, Constants.TOKEN_FOCUS, Constants.TOKEN_KEY_CTRLBREAK, Constants.TOKEN_KEY_CTRLC };
@@ -31,13 +32,16 @@ namespace gsudo.ProcessRenderers
 
             try
             {
-                var t1 = new StreamReader(Console.OpenStandardInput())
-                    .ConsumeOutput((s) => SendKeysToHost(s));
+                if(!Settings.SecurityEnforceUacIsolation)
+                {
+                    var t1 = new StreamReader(Console.OpenStandardInput())
+                        .ConsumeOutput((s) => SendKeysToHost(s));
+                }
 
-                var t2 = new StreamReader(_connection.DataStream, GlobalSettings.Encoding)
+                var t2 = new StreamReader(_connection.DataStream, Settings.Encoding)
                     .ConsumeOutput((s) => WriteToConsole(s));
 
-                var t3 = new StreamReader(_connection.ControlStream, GlobalSettings.Encoding)
+                var t3 = new StreamReader(_connection.ControlStream, Settings.Encoding)
                     .ConsumeOutput((s) => HandleControlData(s));
 
                 while (_connection.IsAlive)
@@ -45,9 +49,9 @@ namespace gsudo.ProcessRenderers
                     await Task.Delay(10).ConfigureAwait(false);
                 }
 
-                if (exitCode.HasValue && exitCode.Value == 0 && GlobalSettings.NewWindow)
+                if (exitCode.HasValue && exitCode.Value == 0 && InputArguments.NewWindow)
                 {
-                    Logger.Instance.Log($"Elevated process started successfully", LogLevel.Debug);
+                    Logger.Instance.Log($"Process started successfully", LogLevel.Debug);
                     return 0;
                 }
                 else if (exitCode.HasValue)
@@ -76,7 +80,7 @@ namespace gsudo.ProcessRenderers
         {
             e.Cancel = true;
 
-            if (++consecutiveCancelKeys > 3 || e.SpecialKey == ConsoleSpecialKey.ControlBreak)
+            if (++consecutiveCancelKeys > 3)
             {
                 expectedClose = true;
                 _connection.FlushAndCloseAll().Wait();
@@ -89,12 +93,11 @@ namespace gsudo.ProcessRenderers
             if (++consecutiveCancelKeys > 2)
             {
                 Logger.Instance.Log("Press CTRL-C again to stop gsudo", LogLevel.Warning);
-                _ = _connection.ControlStream.WriteAsync(Constants.TOKEN_KEY_CTRLBREAK); // .GetAwaiter().GetResult();
             }
-            else
-            {
-                _ = _connection.ControlStream.WriteAsync(Constants.TOKEN_KEY_CTRLC); //.GetAwaiter().GetResult();
-            }
+
+            _ = _connection.ControlStream.WriteAsync(
+                e.SpecialKey== ConsoleSpecialKey.ControlBreak ? Constants.TOKEN_KEY_CTRLBREAK : Constants.TOKEN_KEY_CTRLC
+                ); //.GetAwaiter().GetResult();
         }
 
         private Task WriteToConsole(string s)

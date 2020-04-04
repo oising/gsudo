@@ -41,7 +41,7 @@ namespace gsudo
 
         public static async Task WriteAsync(this Stream stream, string text)
         {
-            var bytes = GlobalSettings.Encoding.GetBytes(text);
+            var bytes = Settings.Encoding.GetBytes(text);
             await stream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
             await stream.FlushAsync().ConfigureAwait(false);
         }
@@ -64,6 +64,13 @@ namespace gsudo
         public static void AddMany<T>(this List<T> list, params T[] items)
         {
             list.AddRange(items);
+        }
+
+        public static T ParseEnum<T>(string inString, bool ignoreCase = true) where T : struct
+        {
+            if (!Enum.TryParse<T>(inString, ignoreCase, out var returnEnum))
+                throw new ApplicationException($"\"{inString}\" is not a valid {typeof(T).Name}");
+            return returnEnum;
         }
     }
 }

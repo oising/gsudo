@@ -11,26 +11,30 @@ namespace gsudo.ProcessHosts
     /// Hosts a process that uses Win32 'AttachConsole' Api so its i/o is natively attached to the
     /// client console. 
     /// </summary>
+    [Obsolete("Superseded by TokenSwitch mode")] // TODO: Possible remove in 1.0
     class AttachedConsoleHost : IProcessHost
     {
         public async Task Start(Connection connection, ElevationRequest elevationRequest)
         {
             var exitCode = 0;
+
+            if (Settings.SecurityEnforceUacIsolation)
+                throw new Exception("Attached mode not supported when SecurityEnforceUacIsolation is set.");
+
             try
             {
+                Native.ConsoleApi.SetConsoleCtrlHandler(ConsoleHelper.IgnoreConsoleCancelKeyPress, true);
                 Native.ConsoleApi.FreeConsole();
-                uint pid = (uint)elevationRequest.ConsoleProcessId;
-                
+                int pid = elevationRequest.ConsoleProcessId;
                 if (Native.ConsoleApi.AttachConsole(pid))
                 {
-                    Native.ConsoleApi.SetConsoleCtrlHandler(HandleConsoleCancelKeyPress, true);
                     System.Environment.CurrentDirectory = elevationRequest.StartFolder;
 
                     try
                     {
-                        var process = Helpers.ProcessFactory.StartInProcessAtached(elevationRequest.FileName, elevationRequest.Arguments);
+                        var process = Helpers.ProcessFactory.StartAttached(elevationRequest.FileName, elevationRequest.Arguments);
 
-                        WaitHandle.WaitAny(new WaitHandle[] { process.GetWaitHandle(), connection.DisconnectedWaitHandle });
+                        WaitHandle.WaitAny(new WaitHandle[] { process.GetProcessWaitHandle(), connection.DisconnectedWaitHandle });
                         if (process.HasExited)
                             exitCode = process.ExitCode;
 
@@ -43,7 +47,10 @@ namespace gsudo.ProcessHosts
                     }
                 }
                 else
-                {   
+                {
+                    var ex = new System.ComponentModel.Win32Exception();
+                    await connection.ControlStream.WriteAsync($"{Constants.TOKEN_ERROR}Server Error: Attach Console Failed.\r\n{ex.Message}\r\n{Constants.TOKEN_ERROR}").ConfigureAwait(false);
+                    Logger.Instance.Log("Attach Console Failed.", LogLevel.Error);
                     exitCode = Constants.GSUDO_ERROR_EXITCODE;
                 }
 
@@ -56,18 +63,10 @@ namespace gsudo.ProcessHosts
             }
             finally
             {
-                Native.ConsoleApi.SetConsoleCtrlHandler(HandleConsoleCancelKeyPress, false);
+                Native.ConsoleApi.SetConsoleCtrlHandler(ConsoleHelper.IgnoreConsoleCancelKeyPress, false);
                 Native.ConsoleApi.FreeConsole();
                 await connection.FlushAndCloseAll().ConfigureAwait(false);
             }
-        }
-
-        private static bool HandleConsoleCancelKeyPress(CtrlTypes ctrlType)
-        {
-            if (ctrlType.In(CtrlTypes.CTRL_C_EVENT, CtrlTypes.CTRL_C_EVENT))
-                return true;
-
-            return false;
         }
     }
 }

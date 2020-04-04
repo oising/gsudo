@@ -10,7 +10,10 @@ namespace gsudo.Native
     [System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1060:Move pinvokes to native methods class", Justification = "Done")]
     static class ConsoleApi
     {
+        internal const int STD_INPUT_HANDLE = -10;
         internal const int STD_OUTPUT_HANDLE = -11;
+        internal const int STD_ERROR_HANDLE = -12;
+
         internal const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
         internal const uint DISABLE_NEWLINE_AUTO_RETURN = 0x0008;
 
@@ -46,7 +49,7 @@ namespace gsudo.Native
 
         // send ctrl-c
         [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool AttachConsole(uint dwProcessId);
+        internal static extern bool AttachConsole(int dwProcessId);
 
         [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
         internal static extern bool FreeConsole();
@@ -61,5 +64,26 @@ namespace gsudo.Native
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
         public static extern System.IntPtr GetCommandLine();
+
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint GetConsoleProcessList(uint[] processList, uint processCount);
+
+        /// <summary>
+        ///     Retrieves a handle to the Shell's desktop window.
+        ///     <para>
+        ///     Go to https://msdn.microsoft.com/en-us/library/windows/desktop/ms633512%28v=vs.85%29.aspx for more
+        ///     information
+        ///     </para>
+        /// </summary>
+        /// <returns>
+        ///     C++ ( Type: HWND )<br />The return value is the handle of the Shell's desktop window. If no Shell process is
+        ///     present, the return value is NULL.
+        /// </returns>
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetShellWindow();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     }
 }

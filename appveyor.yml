@@ -2,9 +2,7 @@ image: Visual Studio 2019
 
 init:
   - git config --global core.autocrlf true
-
-#on_finish:
-#  - ps: $blockRdp = $true; iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
+  - powershell -noprofile -command "Install-Module PSReadLine -Force -SkipPublisherCheck -AllowPrerelease"
 
 before_build:
   - nuget restore src\gsudo.sln
@@ -12,9 +10,12 @@ before_build:
 after_build:
   - 7z a gsudo.%CONFIGURATION%.%APPVEYOR_BUILD_VERSION%.Unsigned.zip %APPVEYOR_BUILD_FOLDER%\src\gsudo\bin\*.*
   - appveyor PushArtifact gsudo.%CONFIGURATION%.%APPVEYOR_BUILD_VERSION%.Unsigned.zip
+  - vstest.console /logger:Appveyor C:\git\gsudo\src\gsudo.Tests\bin\%CONFIGURATION%\gsudo.Tests.dll
+  
+on_finish:
+  - ps: if($env:APPVEYOR_RDP_ENABLED -eq 'TRUE') { $blockRdp = $true; iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1')) }
 
 clone_folder: c:\git\gsudo
-
 platform: Any CPU
 configuration: Release
   
@@ -22,11 +23,6 @@ build:
   parallel: true
   project: src\gsudo.sln
   verbosity: minimal
-  
-test:
-  assemblies:
-    only:
-      - gsudo.Tests.dll
     
 cache:
   - src\packages -> **\packages.config  # preserve "packages" directory in the root of build folder but will reset it if packages.config is modified

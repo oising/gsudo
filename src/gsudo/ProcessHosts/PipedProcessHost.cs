@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using static gsudo.Native.ConsoleApi;
 
 namespace gsudo.ProcessHosts
 {
@@ -13,6 +14,7 @@ namespace gsudo.ProcessHosts
     /// Hosts a console process with redirected StdIn/Out/Err.
     /// Sends all I/O thru the connection.
     /// </summary>
+    [Obsolete("Superseded by TokenSwitch mode")] // TODO: Possible remove in 1.0
     class PipedProcessHost : IProcessHost
     {
         private string lastInboundMessage = null;
@@ -21,19 +23,25 @@ namespace gsudo.ProcessHosts
 
         public async Task Start(Connection connection, ElevationRequest request)
         {
+            Native.ConsoleApi.SetConsoleCtrlHandler(ConsoleHelper.IgnoreConsoleCancelKeyPress, true);
+
             _connection = connection;
+
             try
             {
-                process = ProcessFactory.StartInProcessRedirected(request.FileName, request.Arguments, request.StartFolder);
+                process = ProcessFactory.StartRedirected(request.FileName, request.Arguments, request.StartFolder);
                 
                 Logger.Instance.Log($"Process ({process.Id}) started: {request.FileName} {request.Arguments}", LogLevel.Debug);
 
-                var t1 = process.StandardOutput.ConsumeOutput((s) => WriteToPipe(s));
-                var t2 = process.StandardError.ConsumeOutput((s) => WriteToErrorPipe(s));
-                var t3 = new StreamReader(connection.DataStream, GlobalSettings.Encoding).ConsumeOutput((s) => WriteToProcessStdIn(s, process));
-                var t4 = new StreamReader(connection.ControlStream, GlobalSettings.Encoding).ConsumeOutput((s) => HandleControl(s, process));
+                var t1 = process.StandardOutput.ConsumeOutput(WriteToPipe);
+                var t2 = process.StandardError.ConsumeOutput(WriteToErrorPipe);
+                var t3 = new StreamReader(connection.DataStream, Settings.Encoding).ConsumeOutput((s) => WriteToProcessStdIn(s, process));
+                var t4 = new StreamReader(connection.ControlStream, Settings.Encoding).ConsumeOutput((s) => HandleControl(s, process));
 
-                WaitHandle.WaitAny(new WaitHandle[] { process.GetWaitHandle(), connection.DisconnectedWaitHandle });
+                if (Settings.SecurityEnforceUacIsolation)
+                    process.StandardInput.Close();
+
+                WaitHandle.WaitAny(new WaitHandle[] { process.GetProcessWaitHandle(), connection.DisconnectedWaitHandle });
 
                 if (process.HasExited && connection.IsAlive)
                 {
@@ -56,6 +64,7 @@ namespace gsudo.ProcessHosts
             }
             finally
             {
+                Native.ConsoleApi.SetConsoleCtrlHandler(HandleConsoleCancelKeyPress, false);
                 if (process != null && !process.HasExited)
                 {
                     process?.Terminate();
@@ -63,10 +72,13 @@ namespace gsudo.ProcessHosts
                 process?.Dispose();
             }
         }
-               
-        internal static void HandleCancelKey(object sender, ConsoleCancelEventArgs e)
+
+        private static bool HandleConsoleCancelKeyPress(CtrlTypes ctrlType)
         {
-            e.Cancel = true;
+            if (ctrlType.In(CtrlTypes.CTRL_C_EVENT, CtrlTypes.CTRL_BREAK_EVENT))
+                return true;
+
+            return false;
         }
 
         private bool ShouldWait(StreamReader streamReader)
@@ -88,7 +100,10 @@ namespace gsudo.ProcessHosts
             else
                 lastInboundMessage += s;
 
-            await process.StandardInput.WriteAsync(s).ConfigureAwait(false);
+            if (!Settings.SecurityEnforceUacIsolation)
+            {
+                await process.StandardInput.WriteAsync(s).ConfigureAwait(false);
+            }
         }
 
         static readonly string[] TOKENS = new string[] { "\0", Constants.TOKEN_KEY_CTRLBREAK, Constants.TOKEN_KEY_CTRLC};
@@ -104,14 +119,14 @@ namespace gsudo.ProcessHosts
 
                 if (token == Constants.TOKEN_KEY_CTRLC)
                 {
-                    ProcessExtensions.SendCtrlC(process);
+                    Commands.CtrlCCommand.Invoke(process.Id);
                     lastInboundMessage = null;
                     continue;
                 }
 
                 if (token == Constants.TOKEN_KEY_CTRLBREAK)
                 {
-                    ProcessExtensions.SendCtrlC(process, true);
+                    Commands.CtrlCCommand.Invoke(process.Id, true);
                     lastInboundMessage = null;
                     continue;
                 }
@@ -121,7 +136,7 @@ namespace gsudo.ProcessHosts
 
         private async Task WriteToErrorPipe(string s)
         {
-            if (GlobalSettings.Debug)
+            if (InputArguments.Debug)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine(s);
@@ -140,7 +155,7 @@ namespace gsudo.ProcessHosts
                     s = s.Substring(c);
                     lastInboundMessage = lastInboundMessage.Substring(c);
                 }
-                //if (GlobalSettings.Debug && !string.IsNullOrEmpty(s)) Logger.Instance.Log($"Last input command was: {s}", LogLevel.Debug);
+                //if (InputArguments.Debug && !string.IsNullOrEmpty(s)) Logger.Instance.Log($"Last input command was: {s}", LogLevel.Debug);
                 
             }
             if (string.IsNullOrEmpty(s)) return; // suppress chars n s;
@@ -148,7 +163,7 @@ namespace gsudo.ProcessHosts
             await _connection.DataStream.WriteAsync(s).ConfigureAwait(false);
             await _connection.DataStream.FlushAsync().ConfigureAwait(false);
 
-            if (GlobalSettings.Debug)
+            if (InputArguments.Debug)
             {
                 Console.ForegroundColor = ConsoleColor.Gray;
                 Console.Write(s);
